@@ -18,6 +18,8 @@ import (
 	"github.com/go-sql-driver/mysql"
 )
 
+const configFile = "mysql-replay.conf.json"
+
 type ReplayStatement struct {
 	session int
 	epoch   float64
@@ -157,13 +159,12 @@ func mysqlsession(c <-chan ReplayStatement, session int, firstepoch float64,
 }
 
 func main() {
-	conffile, _ := os.Open("go-mysql-replay.conf.json")
+	conffile, _ := os.Open(configFile)
 	confdec := json.NewDecoder(conffile)
 	config := Configuration{}
 	err := confdec.Decode(&config)
 	if err != nil {
-		log.Fatalf("Error reading configuration from "+
-			"'./go-mysql-replay.conf.json': %s\n", err)
+		log.Fatalf("Error reading configuration from './%s': %s\n", configFile, err)
 	}
 	log.Println("preplaying on server: ", config.Dsn)
 
