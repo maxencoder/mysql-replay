@@ -6,12 +6,16 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/go-sql-driver/mysql"
 	"io"
+	"log"
 	"math"
 	"os"
+	"sort"
 	"strconv"
+	"sync"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 type ReplayStatement struct {
@@ -25,6 +29,63 @@ type Configuration struct {
 	Dsn string
 }
 
+type Stats struct {
+	sync.Mutex
+	wallclocks []time.Duration
+}
+
+func (s *Stats) append(d time.Duration) {
+	s.Lock()
+	defer s.Unlock()
+	s.wallclocks = append(s.wallclocks, d)
+}
+
+func (s *Stats) len() int {
+	s.Lock()
+	defer s.Unlock()
+	return len(s.wallclocks)
+}
+
+func (s *Stats) sort() {
+	s.Lock()
+	defer s.Unlock()
+	sort.Sort(Durations(s.wallclocks))
+}
+
+func (s *Stats) percentile(n float64) time.Duration {
+	s.Lock()
+	defer s.Unlock()
+	return s.wallclocks[int(float64(len(s.wallclocks))*n/100.0)]
+}
+
+func (s *Stats) mean() time.Duration {
+	s.Lock()
+	defer s.Unlock()
+	var sum time.Duration
+	for _, d := range s.wallclocks {
+		sum += d
+	}
+	return sum / time.Duration(len(s.wallclocks))
+}
+
+func (s *Stats) stddev() float64 {
+	mean := s.mean()
+	s.Lock()
+	defer s.Unlock()
+	total := 0.0
+	for _, d := range s.wallclocks {
+		total += math.Pow(float64(d-mean), 2)
+	}
+	variance := total / float64(len(s.wallclocks)-1)
+	return math.Sqrt(variance)
+}
+
+type Durations []time.Duration
+
+func (a Durations) Len() int           { return len(a) }
+func (a Durations) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a Durations) Less(i, j int) bool { return a[i] < a[j] }
+
 func timefromfloat(epoch float64) time.Time {
 	epoch_base := math.Floor(epoch)
 	epoch_frac := epoch - epoch_base
@@ -32,15 +93,17 @@ func timefromfloat(epoch float64) time.Time {
 	return epoch_time
 }
 
+var stats = &Stats{}
+
 func mysqlsession(c <-chan ReplayStatement, session int, firstepoch float64,
 	starttime time.Time, config Configuration) {
-	fmt.Printf("[session %d] NEW SESSION\n", session)
+
+	log.Printf("[session %d] NEW SESSION\n", session)
 
 	db, err := sql.Open("mysql", config.Dsn)
 	if err != nil {
-		panic(err.Error())
+		log.Fatal(err.Error())
 	}
-	dbopen := true
 	defer db.Close()
 
 	last_stmt_epoch := firstepoch
@@ -53,8 +116,7 @@ func mysqlsession(c <-chan ReplayStatement, session int, firstepoch float64,
 			mydelay := time.Since(starttime)
 			delaytime_new := delaytime_orig - mydelay
 
-			fmt.Printf("[session %d] Sleeptime: %s\n", session,
-				delaytime_new)
+			log.Printf("[session %d] Sleeping %s\n", session, delaytime_new)
 			time.Sleep(delaytime_new)
 		}
 		last_stmt_epoch = pkt.epoch
@@ -62,30 +124,33 @@ func mysqlsession(c <-chan ReplayStatement, session int, firstepoch float64,
 		case 14: // Ping
 			continue
 		case 1: // Quit
-			fmt.Printf("[session %d] COMMAND REPLAY: QUIT\n", session)
-			dbopen = false
+			log.Printf("[session %d] COMMAND REPLAY: QUIT\n", session)
 			db.Close()
+			db = nil
 		case 3: // Query
-			if dbopen == false {
-				fmt.Printf("[session %d] RECONNECT\n", session)
-				db, err = sql.Open("mysql", config.Dsn)
-				if err != nil {
-					panic(err.Error())
-				}
-				dbopen = true
+			if db == nil {
+				log.Printf("[session %d] Tried to query on a closed session\n", session)
 			}
-			fmt.Printf("[session %d] STATEMENT REPLAY: %s\n", session,
-				   pkt.stmt)
+
+			log.Printf("[session %d] STATEMENT REPLAY: %s\n", session, pkt.stmt)
+
+			t0 := time.Now()
 			_, err := db.Exec(pkt.stmt)
+			stats.append(time.Since(t0))
+
 			if err != nil {
-				if mysqlError, ok := err.(*mysql.MySQLError); ok {
-					if mysqlError.Number == 1205 { // Lock wait timeout
-						fmt.Printf("ERROR IGNORED: %s",
-							err.Error())
-					}
-				} else {
-					panic(err.Error())
+				var mysqlError *mysql.MySQLError
+				var ok bool
+				if mysqlError, ok = err.(*mysql.MySQLError); !ok {
+					log.Fatal(err.Error())
 				}
+
+				// Lock wait timeout ???
+				if mysqlError.Number == 1205 {
+					log.Printf("ERROR IGNORED: %s", err.Error())
+					continue
+				}
+				log.Println(err.Error())
 			}
 		}
 	}
@@ -97,17 +162,17 @@ func main() {
 	config := Configuration{}
 	err := confdec.Decode(&config)
 	if err != nil {
-		fmt.Printf("Error reading configuration from "+
+		log.Fatalf("Error reading configuration from "+
 			"'./go-mysql-replay.conf.json': %s\n", err)
 	}
+	log.Println("preplaying on server: ", config.Dsn)
 
-	fileflag := flag.String("f", "./test.dat",
-		"Path to datafile for replay")
+	filename := flag.String("f", "./test.dat", "Path to datafile for replay")
 	flag.Parse()
 
-	datFile, err := os.Open(*fileflag)
+	datFile, err := os.Open(*filename)
 	if err != nil {
-		fmt.Println(err)
+		log.Fatal(err.Error())
 	}
 
 	reader := csv.NewReader(datFile)
@@ -122,34 +187,43 @@ func main() {
 			break
 		}
 		if err != nil {
-			panic(err.Error)
+			log.Println(err.Error())
+			continue
 		}
 		sessionid, err := strconv.Atoi(stmt[0])
 		if err != nil {
-			fmt.Println(err)
+			log.Println(err)
 		}
 		cmd_src, err := strconv.Atoi(stmt[2])
 		if err != nil {
-			fmt.Println(err)
+			log.Println(err)
 		}
 		cmd := uint8(cmd_src)
 		epoch, err := strconv.ParseFloat(stmt[1], 64)
 		if err != nil {
-			fmt.Println(err)
+			log.Println(err)
 		}
-		pkt := ReplayStatement{session: sessionid, epoch: epoch,
-			cmd: cmd, stmt: stmt[3]}
+		pkt := ReplayStatement{session: sessionid, epoch: epoch, cmd: cmd, stmt: stmt[3]}
 		if firstepoch == 0.0 {
 			firstepoch = pkt.epoch
 		}
 		if sessions[pkt.session] != nil {
 			sessions[pkt.session] <- pkt
-		} else {
-			sess := make(chan ReplayStatement)
-			sessions[pkt.session] = sess
-			go mysqlsession(sessions[pkt.session], pkt.session,
-				firstepoch, starttime, config)
-			sessions[pkt.session] <- pkt
+			continue
 		}
+
+		sess := make(chan ReplayStatement)
+		sessions[pkt.session] = sess
+		go mysqlsession(sessions[pkt.session], pkt.session,
+			firstepoch, starttime, config)
+		sessions[pkt.session] <- pkt
 	}
+
+	stats.sort()
+	fmt.Printf("collected %v stats\n", stats.len())
+	fmt.Printf("stats: median: %v mean: %v stddev: %v\n",
+		stats.percentile(50), stats.mean(), stats.stddev())
+	fmt.Printf("percentiles: 90: %v 95: %v 99: %v 99.9: %v\n",
+		stats.percentile(90), stats.percentile(95),
+		stats.percentile(99), stats.percentile(99.9))
 }
