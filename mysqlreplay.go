@@ -1,7 +1,6 @@
 package main
 
 import (
-	"database/sql"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -15,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/siddontang/go-mysql/client"
 )
 
 const configFile = "mysql-replay.conf.json"
@@ -28,7 +27,10 @@ type ReplayStatement struct {
 }
 
 type Configuration struct {
-	Dsn string
+	Addr     string
+	User     string
+	Password string
+	DbName   string
 }
 
 type Stats struct {
@@ -98,11 +100,11 @@ func timefromfloat(epoch float64) time.Time {
 var stats = &Stats{}
 
 func mysqlsession(c <-chan ReplayStatement, session int, firstepoch float64,
-	starttime time.Time, config Configuration) {
+	starttime time.Time, conf Configuration) {
 
 	log.Printf("[session %d] NEW SESSION\n", session)
 
-	db, err := sql.Open("mysql", config.Dsn)
+	db, err := client.Connect(conf.Addr, conf.User, conf.Password, conf.DbName)
 	if err != nil {
 		log.Fatal(err.Error())
 	}
@@ -137,21 +139,10 @@ func mysqlsession(c <-chan ReplayStatement, session int, firstepoch float64,
 			log.Printf("[session %d] STATEMENT REPLAY: %s\n", session, pkt.stmt)
 
 			t0 := time.Now()
-			_, err := db.Exec(pkt.stmt)
+			_, err := db.Execute(pkt.stmt)
 			stats.append(time.Since(t0))
 
 			if err != nil {
-				var mysqlError *mysql.MySQLError
-				var ok bool
-				if mysqlError, ok = err.(*mysql.MySQLError); !ok {
-					log.Fatal(err.Error())
-				}
-
-				// Lock wait timeout ???
-				if mysqlError.Number == 1205 {
-					log.Printf("ERROR IGNORED: %s", err.Error())
-					continue
-				}
 				log.Println(err.Error())
 			}
 		}
@@ -159,14 +150,14 @@ func mysqlsession(c <-chan ReplayStatement, session int, firstepoch float64,
 }
 
 func main() {
-	conffile, _ := os.Open(configFile)
-	confdec := json.NewDecoder(conffile)
+	cf, _ := os.Open(configFile)
+	dec := json.NewDecoder(cf)
 	config := Configuration{}
-	err := confdec.Decode(&config)
+	err := dec.Decode(&config)
 	if err != nil {
 		log.Fatalf("Error reading configuration from './%s': %s\n", configFile, err)
 	}
-	log.Println("preplaying on server: ", config.Dsn)
+	log.Printf("preplaying with config: %#v\n", config)
 
 	filename := flag.String("f", "./test.dat", "Path to datafile for replay")
 	flag.Parse()
