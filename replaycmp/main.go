@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -13,16 +14,18 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/maxencoder/mixer/proxy"
 	"github.com/maxencoder/mixer/sqlparser"
+	"github.com/maxencoder/mysql-replay/stats"
 	"github.com/siddontang/go-mysql/client"
 	"github.com/siddontang/go-mysql/mysql"
 )
 
 const configFile = "mysql-replay.conf.json"
+
+var st = &stats.Stats{}
 
 type ReplayStatement struct {
 	session int
@@ -38,63 +41,6 @@ type Configuration struct {
 	DbName   string
 }
 
-type Stats struct {
-	sync.Mutex
-	wallclocks []time.Duration
-}
-
-func (s *Stats) append(d time.Duration) {
-	s.Lock()
-	defer s.Unlock()
-	s.wallclocks = append(s.wallclocks, d)
-}
-
-func (s *Stats) len() int {
-	s.Lock()
-	defer s.Unlock()
-	return len(s.wallclocks)
-}
-
-func (s *Stats) sort() {
-	s.Lock()
-	defer s.Unlock()
-	sort.Sort(Durations(s.wallclocks))
-}
-
-func (s *Stats) percentile(n float64) time.Duration {
-	s.Lock()
-	defer s.Unlock()
-	return s.wallclocks[int(float64(len(s.wallclocks))*n/100.0)]
-}
-
-func (s *Stats) mean() time.Duration {
-	s.Lock()
-	defer s.Unlock()
-	var sum time.Duration
-	for _, d := range s.wallclocks {
-		sum += d
-	}
-	return sum / time.Duration(len(s.wallclocks))
-}
-
-func (s *Stats) stddev() float64 {
-	mean := s.mean()
-	s.Lock()
-	defer s.Unlock()
-	total := 0.0
-	for _, d := range s.wallclocks {
-		total += math.Pow(float64(d-mean), 2)
-	}
-	variance := total / float64(len(s.wallclocks)-1)
-	return math.Sqrt(variance)
-}
-
-type Durations []time.Duration
-
-func (a Durations) Len() int           { return len(a) }
-func (a Durations) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a Durations) Less(i, j int) bool { return a[i] < a[j] }
-
 func timefromfloat(epoch float64) time.Time {
 	epoch_base := math.Floor(epoch)
 	epoch_frac := epoch - epoch_base
@@ -102,12 +48,8 @@ func timefromfloat(epoch float64) time.Time {
 	return epoch_time
 }
 
-var stats = &Stats{}
-
-func mysqlsession(c <-chan ReplayStatement, session int, firstepoch float64,
+func replayAndCmp(c <-chan ReplayStatement, session int, firstepoch float64,
 	starttime time.Time, conf *Configuration, conf2 *Configuration) {
-
-	log.Printf("[session %d] NEW SESSION\n", session)
 
 	var db, db2 *client.Conn
 	var err error
@@ -125,7 +67,7 @@ func mysqlsession(c <-chan ReplayStatement, session int, firstepoch float64,
 	last_stmt_epoch := firstepoch
 	for {
 		pkt := <-c
-		if last_stmt_epoch != 0.0 {
+		if false && last_stmt_epoch != 0.0 {
 			firsttime := timefromfloat(firstepoch)
 			pkttime := timefromfloat(pkt.epoch)
 			delaytime_orig := pkttime.Sub(firsttime)
@@ -133,14 +75,13 @@ func mysqlsession(c <-chan ReplayStatement, session int, firstepoch float64,
 			delaytime_new := delaytime_orig - mydelay
 
 			log.Printf("[session %d] Sleeping %s\n", session, delaytime_new)
-			//time.Sleep(delaytime_new)
+			time.Sleep(delaytime_new)
 		}
 		last_stmt_epoch = pkt.epoch
 		switch pkt.cmd {
 		case 14: // Ping
 			continue
 		case 1: // Quit
-			log.Printf("[session %d] COMMAND REPLAY: QUIT\n", session)
 			db.Close()
 			db = nil
 			db2.Close()
@@ -148,33 +89,48 @@ func mysqlsession(c <-chan ReplayStatement, session int, firstepoch float64,
 		case 3: // Query
 			if db == nil {
 				log.Printf("[session %d] Tried to query on a closed session\n", session)
+				continue
 			}
-
-			log.Printf("[session %d] STATEMENT REPLAY: %s\n", session, pkt.stmt)
 
 			t0 := time.Now()
 			r1, err := db.Execute(pkt.stmt)
-			stats.append(time.Since(t0))
+			st.Append(time.Since(t0))
 			if err != nil {
 				log.Println(err.Error())
+				continue
 			}
 
 			r2, err := db2.Execute(pkt.stmt)
 			if err != nil {
 				log.Println(err.Error())
+				continue
 			}
 
+			// skip known problems
 			if strings.Contains(pkt.stmt, "db_heartbeat") || strings.Contains(pkt.stmt, "slave_master_info") {
 				continue
 			}
-			if !resultsEqual(pkt.stmt, r1, r2) {
+
+			stmt, err := sqlparser.Parse(pkt.stmt)
+			if err != nil {
+				log.Println("cannot compare results: failed to parse query")
+				continue
+			}
+
+			s, ok := stmt.(*sqlparser.Select)
+			if !ok {
+				log.Printf("statements other than Select are not supported:\n%s\n", pkt.stmt)
+				continue
+			}
+
+			if !resultsEqual(s, r1, r2) {
 				log.Printf("[session %d] results not equal for stmt: \n%s\n", session, pkt.stmt)
 			}
 		}
 	}
 }
 
-func resultsEqual(sql string, r1, r2 *mysql.Result) bool {
+func resultsEqual(stmt *sqlparser.Select, r1, r2 *mysql.Result) bool {
 	if r1 == nil && r2 == nil {
 		return true
 	} else if r1 == nil || r2 == nil {
@@ -204,6 +160,47 @@ func resultsEqual(sql string, r1, r2 *mysql.Result) bool {
 
 	if !reflect.DeepEqual(rs1.Fields, rs2.Fields) {
 		log.Println("resultset.Fields not equal", rs1.Fields, rs2.Fields)
+		cmp := func(fs1, fs2 []*mysql.Field) {
+			if len(fs1) != len(fs2) {
+				log.Printf("number of fields not equal", len(fs1), len(fs2))
+				return
+			}
+			for i, f1 := range fs1 {
+				f2 := fs2[i]
+				switch {
+				case false && !bytes.Equal(f1.Data, f2.Data):
+					log.Printf("Field.Data not equal for %s, %s\n", f1.Name, f2.Name)
+					log.Printf("Field.Data not equal for \n%v, \n%v\n", f1.Data, f2.Data)
+					log.Fatal("enough")
+				case !bytes.Equal(f1.Schema, f2.Schema):
+					log.Printf("Field.Schema not equal for %v, %v\n", f1.Name, f2.Name)
+				case !bytes.Equal(f1.Table, f2.Table):
+					log.Printf("Field.Table not equal for %v, %v\n", f1.Name, f2.Name)
+				case !bytes.Equal(f1.OrgTable, f2.OrgTable):
+					log.Printf("Field.OrgTable not equal for %v, %v\n", f1.Name, f2.Name)
+				case !bytes.Equal(f1.Name, f2.Name):
+					log.Printf("Field.Name not equal for %v, %v\n", f1.Name, f2.Name)
+				case !bytes.Equal(f1.OrgName, f2.OrgName):
+					log.Printf("Field.OrgName not equal for %v, %v\n", f1.Name, f2.Name)
+				case f1.Charset != f2.Charset:
+					log.Printf("Field.Charset not equal for %s, %s\n", f1.Name, f2.Name)
+					log.Printf("Field.Charset not equal for %v, %v\n", f1.Charset, f2.Charset)
+				case f1.ColumnLength != f2.ColumnLength:
+					log.Printf("Field.ColumnLength not equal for %v, %v\n", f1.Name, f2.Name)
+				case f1.Type != f2.Type:
+					log.Printf("Field.Type not equal for %v, %v\n", f1.Name, f2.Name)
+				case f1.Flag != f2.Flag:
+					log.Printf("Field.Flag not equal for %v, %v\n", f1.Name, f2.Name)
+				case f1.Decimal != f2.Decimal:
+					log.Printf("Field.Decimal not equal for %v, %v\n", f1.Name, f2.Name)
+				case f1.DefaultValueLength != f2.DefaultValueLength:
+					log.Printf("Field.DefaultValueLength not equal for %v, %v\n", f1.Name, f2.Name)
+				case !bytes.Equal(f1.DefaultValue, f2.DefaultValue):
+					log.Printf("Field.DefaultValue not equal for %v, %v\n", f1.Name, f2.Name)
+				}
+			}
+		}
+		cmp(rs1.Fields, rs2.Fields)
 		return false
 	}
 	if !reflect.DeepEqual(rs1.FieldNames, rs2.FieldNames) {
@@ -211,16 +208,8 @@ func resultsEqual(sql string, r1, r2 *mysql.Result) bool {
 		return false
 	}
 
-	stmt, err := sqlparser.Parse(sql)
-	if err != nil {
-		log.Println("cannot compare results: failed to parse query")
-		return false
-	}
-
-	s := stmt.(*sqlparser.Select)
-
 	// fully sort result sets unless already sorted
-	if s.OrderBy == nil {
+	if true || stmt.OrderBy == nil {
 		sk := make([]proxy.SortKey, len(rs1.Fields))
 
 		for i, f := range rs1.Fields {
@@ -293,7 +282,7 @@ func main() {
 			break
 		}
 		if err != nil {
-			log.Println(err.Error())
+			log.Println("error reading csv:", err.Error())
 			continue
 		}
 		sessionid, err := strconv.Atoi(stmt[0])
@@ -320,16 +309,16 @@ func main() {
 
 		sess := make(chan ReplayStatement)
 		sessions[pkt.session] = sess
-		go mysqlsession(sessions[pkt.session], pkt.session,
+		go replayAndCmp(sessions[pkt.session], pkt.session,
 			firstepoch, starttime, &conf1, &conf2)
 		sessions[pkt.session] <- pkt
 	}
 
-	stats.sort()
-	fmt.Printf("collected %v stats\n", stats.len())
+	st.Sort()
+	fmt.Printf("collected %v stats\n", st.Len())
 	fmt.Printf("stats: median: %v mean: %v stddev: %v\n",
-		stats.percentile(50), stats.mean(), stats.stddev())
+		st.Percentile(50), st.Mean(), st.Stddev())
 	fmt.Printf("percentiles: 90: %v 95: %v 99: %v 99.9: %v\n",
-		stats.percentile(90), stats.percentile(95),
-		stats.percentile(99), stats.percentile(99.9))
+		st.Percentile(90), st.Percentile(95),
+		st.Percentile(99), st.Percentile(99.9))
 }

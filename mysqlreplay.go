@@ -9,15 +9,16 @@ import (
 	"log"
 	"math"
 	"os"
-	"sort"
 	"strconv"
-	"sync"
 	"time"
 
+	"github.com/maxencoder/mysql-replay/stats"
 	"github.com/siddontang/go-mysql/client"
 )
 
 const configFile = "mysql-replay.conf.json"
+
+var st = &stats.Stats{}
 
 type ReplayStatement struct {
 	session int
@@ -33,71 +34,12 @@ type Configuration struct {
 	DbName   string
 }
 
-type Stats struct {
-	sync.Mutex
-	wallclocks []time.Duration
-}
-
-func (s *Stats) append(d time.Duration) {
-	s.Lock()
-	defer s.Unlock()
-	s.wallclocks = append(s.wallclocks, d)
-}
-
-func (s *Stats) len() int {
-	s.Lock()
-	defer s.Unlock()
-	return len(s.wallclocks)
-}
-
-func (s *Stats) sort() {
-	s.Lock()
-	defer s.Unlock()
-	sort.Sort(Durations(s.wallclocks))
-}
-
-func (s *Stats) percentile(n float64) time.Duration {
-	s.Lock()
-	defer s.Unlock()
-	return s.wallclocks[int(float64(len(s.wallclocks))*n/100.0)]
-}
-
-func (s *Stats) mean() time.Duration {
-	s.Lock()
-	defer s.Unlock()
-	var sum time.Duration
-	for _, d := range s.wallclocks {
-		sum += d
-	}
-	return sum / time.Duration(len(s.wallclocks))
-}
-
-func (s *Stats) stddev() float64 {
-	mean := s.mean()
-	s.Lock()
-	defer s.Unlock()
-	total := 0.0
-	for _, d := range s.wallclocks {
-		total += math.Pow(float64(d-mean), 2)
-	}
-	variance := total / float64(len(s.wallclocks)-1)
-	return math.Sqrt(variance)
-}
-
-type Durations []time.Duration
-
-func (a Durations) Len() int           { return len(a) }
-func (a Durations) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a Durations) Less(i, j int) bool { return a[i] < a[j] }
-
 func timefromfloat(epoch float64) time.Time {
 	epoch_base := math.Floor(epoch)
 	epoch_frac := epoch - epoch_base
 	epoch_time := time.Unix(int64(epoch_base), int64(epoch_frac*1000000000))
 	return epoch_time
 }
-
-var stats = &Stats{}
 
 func mysqlsession(c <-chan ReplayStatement, session int, firstepoch float64,
 	starttime time.Time, conf Configuration) {
@@ -140,7 +82,7 @@ func mysqlsession(c <-chan ReplayStatement, session int, firstepoch float64,
 
 			t0 := time.Now()
 			_, err := db.Execute(pkt.stmt)
-			stats.append(time.Since(t0))
+			st.Append(time.Since(t0))
 
 			if err != nil {
 				log.Println(err.Error())
@@ -179,7 +121,7 @@ func main() {
 			break
 		}
 		if err != nil {
-			log.Println(err.Error())
+			log.Println("error reading csv:", err.Error())
 			continue
 		}
 		sessionid, err := strconv.Atoi(stmt[0])
@@ -211,11 +153,11 @@ func main() {
 		sessions[pkt.session] <- pkt
 	}
 
-	stats.sort()
-	fmt.Printf("collected %v stats\n", stats.len())
+	st.Sort()
+	fmt.Printf("collected %v stats\n", st.Len())
 	fmt.Printf("stats: median: %v mean: %v stddev: %v\n",
-		stats.percentile(50), stats.mean(), stats.stddev())
+		st.Percentile(50), st.Mean(), st.Stddev())
 	fmt.Printf("percentiles: 90: %v 95: %v 99: %v 99.9: %v\n",
-		stats.percentile(90), stats.percentile(95),
-		stats.percentile(99), stats.percentile(99.9))
+		st.Percentile(90), st.Percentile(95),
+		st.Percentile(99), st.Percentile(99.9))
 }
