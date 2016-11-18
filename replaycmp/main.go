@@ -51,18 +51,20 @@ func timefromfloat(epoch float64) time.Time {
 func replayAndCmp(c <-chan ReplayStatement, session int, firstepoch float64,
 	starttime time.Time, conf *Configuration, conf2 *Configuration) {
 
-	var db, db2 *client.Conn
+	var conn, conn2 *client.Conn
 	var err error
-	db, err = client.Connect(conf.Addr, conf.User, conf.Password, conf.DbName)
+	conn, err = client.Connect(conf.Addr, conf.User, conf.Password, conf.DbName)
 	if err != nil {
 		log.Fatal(err.Error())
 	}
-	db2, err = client.Connect(conf2.Addr, conf2.User, conf2.Password, conf2.DbName)
+	conn.SetCharset("utf8mb4")
+	conn2, err = client.Connect(conf2.Addr, conf2.User, conf2.Password, conf2.DbName)
 	if err != nil {
 		log.Fatal(err.Error())
 	}
-	defer db.Close()
-	defer db2.Close()
+	conn2.SetCharset("utf8mb4")
+	defer conn.Close()
+	defer conn2.Close()
 
 	last_stmt_epoch := firstepoch
 	for {
@@ -82,27 +84,41 @@ func replayAndCmp(c <-chan ReplayStatement, session int, firstepoch float64,
 		case 14: // Ping
 			continue
 		case 1: // Quit
-			db.Close()
-			db = nil
-			db2.Close()
-			db2 = nil
+			continue
+			conn.Close()
+			conn = nil
+			conn2.Close()
+			conn2 = nil
 		case 3: // Query
-			if db == nil {
+			if conn == nil {
 				log.Printf("[session %d] Tried to query on a closed session\n", session)
 				continue
 			}
 
-			t0 := time.Now()
-			r1, err := db.Execute(pkt.stmt)
-			st.Append(time.Since(t0))
+			r2, err := conn2.Execute(pkt.stmt)
 			if err != nil {
-				log.Println(err.Error())
+				log.Printf("[session %d] exec2 err: %s:\n%s", session, err.Error(), pkt.stmt)
 				continue
 			}
 
-			r2, err := db2.Execute(pkt.stmt)
+			stmt, err := sqlparser.Parse(pkt.stmt)
 			if err != nil {
-				log.Println(err.Error())
+				log.Println("[session %d] cannot compare results: failed to parse query:\n", session, pkt.stmt)
+				continue
+			}
+
+			s, ok := stmt.(*sqlparser.Select)
+			if !ok {
+				log.Printf("[session %d] statements other than Select are not supported:\n%s\n",
+					session, pkt.stmt)
+				continue
+			}
+
+			t0 := time.Now()
+			r1, err := conn.Execute(pkt.stmt)
+			st.Append(time.Since(t0))
+			if err != nil {
+				log.Printf("[session %d] exec1 err: %s:\n%s", session, err.Error(), pkt.stmt)
 				continue
 			}
 
@@ -110,19 +126,6 @@ func replayAndCmp(c <-chan ReplayStatement, session int, firstepoch float64,
 			if strings.Contains(pkt.stmt, "db_heartbeat") || strings.Contains(pkt.stmt, "slave_master_info") {
 				continue
 			}
-
-			stmt, err := sqlparser.Parse(pkt.stmt)
-			if err != nil {
-				log.Println("cannot compare results: failed to parse query")
-				continue
-			}
-
-			s, ok := stmt.(*sqlparser.Select)
-			if !ok {
-				log.Printf("statements other than Select are not supported:\n%s\n", pkt.stmt)
-				continue
-			}
-
 			if !resultsEqual(s, r1, r2) {
 				log.Printf("[session %d] results not equal for stmt: \n%s\n", session, pkt.stmt)
 			}
@@ -170,8 +173,6 @@ func resultsEqual(stmt *sqlparser.Select, r1, r2 *mysql.Result) bool {
 				switch {
 				case false && !bytes.Equal(f1.Data, f2.Data):
 					log.Printf("Field.Data not equal for %s, %s\n", f1.Name, f2.Name)
-					log.Printf("Field.Data not equal for \n%v, \n%v\n", f1.Data, f2.Data)
-					log.Fatal("enough")
 				case !bytes.Equal(f1.Schema, f2.Schema):
 					log.Printf("Field.Schema not equal for %v, %v\n", f1.Name, f2.Name)
 				case !bytes.Equal(f1.Table, f2.Table):
